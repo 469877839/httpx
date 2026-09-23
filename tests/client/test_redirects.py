@@ -445,3 +445,218 @@ async def test_async_invalid_redirect():
             await client.get(
                 "http://example.org/invalid_redirect", follow_redirects=True
             )
+
+
+class SyncTrackingStream(httpx.SyncByteStream):
+    def __init__(self, body: bytes = b"") -> None:
+        self._body = body
+        self.closed = False
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        yield self._body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class AsyncTrackingStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes = b"") -> None:
+        self._body = body
+        self.closed = False
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield self._body
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class SyncFailingCloseStream(SyncTrackingStream):
+    def close(self) -> None:
+        raise RuntimeError("Unable to close the response stream.")
+
+
+class AsyncFailingCloseStream(AsyncTrackingStream):
+    async def aclose(self) -> None:
+        raise RuntimeError("Unable to close the response stream.")
+
+
+def test_sync_too_many_redirects_closes_redirect_responses():
+    streams: typing.List[SyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        stream = SyncTrackingStream(b"<a href='/redirect_loop'>here</a>")
+        streams.append(stream)
+        return httpx.Response(303, headers={"location": "/redirect_loop"}, stream=stream)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), max_redirects=3)
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+    assert len(streams) == 4
+    assert all(stream.closed for stream in streams)
+
+
+@pytest.mark.anyio
+async def test_async_too_many_redirects_closes_redirect_responses():
+    streams: typing.List[AsyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        stream = AsyncTrackingStream(b"<a href='/redirect_loop'>here</a>")
+        streams.append(stream)
+        return httpx.Response(303, headers={"location": "/redirect_loop"}, stream=stream)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), max_redirects=3
+    ) as client:
+        with pytest.raises(httpx.TooManyRedirects):
+            await client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+    assert len(streams) == 4
+    assert all(stream.closed for stream in streams)
+
+
+def test_sync_invalid_redirect_closes_response():
+    streams: typing.List[SyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        stream = SyncTrackingStream()
+        streams.append(stream)
+        raw_headers = [(b"location", "https://😇/".encode("utf-8"))]
+        return httpx.Response(303, headers=raw_headers, stream=stream)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("https://example.org/invalid_redirect", follow_redirects=True)
+
+    assert len(streams) == 1
+    assert streams[0].closed
+
+
+@pytest.mark.anyio
+async def test_async_invalid_redirect_closes_response():
+    streams: typing.List[AsyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        stream = AsyncTrackingStream()
+        streams.append(stream)
+        raw_headers = [(b"location", "https://😇/".encode("utf-8"))]
+        return httpx.Response(303, headers=raw_headers, stream=stream)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await client.get(
+                "https://example.org/invalid_redirect", follow_redirects=True
+            )
+
+    assert len(streams) == 1
+    assert streams[0].closed
+
+
+def test_sync_redirect_transport_error_closes_redirect_responses():
+    streams: typing.List[SyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            stream = SyncTrackingStream()
+            streams.append(stream)
+            return httpx.Response(303, headers={"location": "/error"}, stream=stream)
+        raise httpx.ConnectError("Unable to connect.", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.ConnectError):
+        client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert len(streams) == 1
+    assert streams[0].closed
+
+
+@pytest.mark.anyio
+async def test_async_redirect_transport_error_closes_redirect_responses():
+    streams: typing.List[AsyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            stream = AsyncTrackingStream()
+            streams.append(stream)
+            return httpx.Response(303, headers={"location": "/error"}, stream=stream)
+        raise httpx.ConnectError("Unable to connect.", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.ConnectError):
+            await client.get("https://example.org/redirect", follow_redirects=True)
+
+    assert len(streams) == 1
+    assert streams[0].closed
+
+
+def test_sync_redirect_close_failure_preserves_original_exception():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_headers = [(b"location", "https://😇/".encode("utf-8"))]
+        return httpx.Response(303, headers=raw_headers, stream=SyncFailingCloseStream())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("https://example.org/invalid_redirect", follow_redirects=True)
+
+
+@pytest.mark.anyio
+async def test_async_redirect_close_failure_preserves_original_exception():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_headers = [(b"location", "https://😇/".encode("utf-8"))]
+        return httpx.Response(303, headers=raw_headers, stream=AsyncFailingCloseStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await client.get(
+                "https://example.org/invalid_redirect", follow_redirects=True
+            )
+
+
+def test_sync_redirect_final_response_remains_streaming():
+    streams: typing.List[SyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            stream = SyncTrackingStream(b"<a href='/final'>here</a>")
+            streams.append(stream)
+            return httpx.Response(303, headers={"location": "/final"}, stream=stream)
+        stream = SyncTrackingStream(b"Hello, world!")
+        streams.append(stream)
+        return httpx.Response(200, stream=stream)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with client.stream(
+        "GET", "https://example.org/redirect", follow_redirects=True
+    ) as response:
+        assert response.status_code == httpx.codes.OK
+        assert not response.is_closed
+        assert response.read() == b"Hello, world!"
+
+    assert response.is_closed
+    assert all(stream.closed for stream in streams)
+
+
+@pytest.mark.anyio
+async def test_async_redirect_final_response_remains_streaming():
+    streams: typing.List[AsyncTrackingStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            stream = AsyncTrackingStream(b"<a href='/final'>here</a>")
+            streams.append(stream)
+            return httpx.Response(303, headers={"location": "/final"}, stream=stream)
+        stream = AsyncTrackingStream(b"Hello, world!")
+        streams.append(stream)
+        return httpx.Response(200, stream=stream)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with client.stream(
+            "GET", "https://example.org/redirect", follow_redirects=True
+        ) as response:
+            assert response.status_code == httpx.codes.OK
+            assert not response.is_closed
+            assert await response.aread() == b"Hello, world!"
+
+    assert response.is_closed
+    assert all(stream.closed for stream in streams)

@@ -995,7 +995,13 @@ class Client(BaseClient):
                     return response
 
             except BaseException as exc:
-                response.close()
+                try:
+                    response.close()
+                except Exception:
+                    # Ensure that a failure to close the response does not
+                    # mask the original exception that caused the request
+                    # to fail.
+                    pass
                 raise exc
 
     def _send_single_request(self, request: Request) -> Response:
@@ -1711,7 +1717,13 @@ class AsyncClient(BaseClient):
                     return response
 
             except BaseException as exc:
-                await response.aclose()
+                try:
+                    await response.aclose()
+                except Exception:
+                    # Ensure that a failure to close the response does not
+                    # mask the original exception that caused the request
+                    # to fail.
+                    pass
                 raise exc
 
     async def _send_single_request(self, request: Request) -> Response:
