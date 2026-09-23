@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* Ensure redirect responses are always closed when leaving the redirect
+  handling path, and never let a failure while closing a response mask the
+  original request exception.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.
