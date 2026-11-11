@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Implement `qop="auth-int"` for `DigestAuth`, including request entity
+  digests, bounded spooling of streaming request bodies, `stale`
+  re-challenge handling, and verification of the `rspauth` value in
+  `Authentication-Info` responses via the new
+  `response.digest_auth_verified` attribute and `DigestAuthError` exception.
 
 ## 0.28.1 (6th December, 2024)
 

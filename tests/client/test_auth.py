@@ -502,14 +502,27 @@ async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) 
 
 
 @pytest.mark.anyio
-async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+async def test_digest_auth_qop_auth_int() -> None:
+    # Detailed 'auth-int' coverage lives in tests/test_auth_int.py; this is
+    # the integration-level check that the challenge is honoured.
     url = "https://example.org/"
     auth = httpx.DigestAuth(username="user", password="password123")
     app = DigestApp(qop="auth-int")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
-        with pytest.raises(NotImplementedError):
-            await client.get(url, auth=auth)
+        response = await client.post(url, content=b"request body", auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+    authorization = typing.cast(typing.Dict[str, typing.Any], response.json())["auth"]
+    scheme, _, fields = authorization.partition(" ")
+    assert scheme == "Digest"
+
+    response_fields = [field.strip() for field in fields.split(",")]
+    digest_data = dict(field.split("=") for field in response_fields)
+    assert digest_data["qop"] == "auth-int"
+    assert digest_data["nc"] == "00000001"
 
 
 @pytest.mark.anyio

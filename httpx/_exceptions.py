@@ -17,6 +17,7 @@ Our exception hierarchy:
       - ProtocolError
         · LocalProtocolError
         · RemoteProtocolError
+          + DigestAuthError
       - ProxyError
       - UnsupportedProtocol
     + DecodingError
@@ -45,6 +46,7 @@ __all__ = [
     "ConnectTimeout",
     "CookieConflict",
     "DecodingError",
+    "DigestAuthError",
     "HTTPError",
     "HTTPStatusError",
     "InvalidURL",
@@ -234,6 +236,15 @@ class RemoteProtocolError(ProtocolError):
     The protocol was violated by the server.
 
     For example, returning malformed HTTP.
+    """
+
+
+class DigestAuthError(RemoteProtocolError):
+    """
+    The server returned an invalid Digest authentication response.
+
+    For example, an 'Authentication-Info' header with an 'rspauth' value
+    that does not match the response body.
     """
 
 

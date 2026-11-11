@@ -28,7 +28,7 @@ HTTP basic authentication is an unencrypted authentication scheme that uses a si
 
 ## Digest authentication
 
-HTTP digest authentication is a challenge-response authentication scheme. Unlike basic authentication it provides encryption, and can be used over unencrypted `http` connections. It requires an additional round-trip in order to negotiate the authentication. 
+HTTP digest authentication is a challenge-response authentication scheme. Unlike basic authentication it provides encryption, and can be used over unencrypted `http` connections. It requires an additional round-trip in order to negotiate the authentication.
 
 ```pycon
 >>> auth = httpx.DigestAuth(username="olivia", password="secret")
@@ -38,6 +38,34 @@ HTTP digest authentication is a challenge-response authentication scheme. Unlike
 <Response [200 OK]>
 >>> response.history
 [<Response [401 UNAUTHORIZED]>]
+```
+
+### `qop=auth-int`
+
+Digest servers may require the `auth-int` quality of protection, in which the
+request entity body takes part in the digest. HTTPX honors `qop="auth-int"`
+challenges (while still preferring `auth` when the server offers both),
+covering all the supported algorithms (`MD5`, `SHA`, `SHA-256`, `SHA-512` and
+their `-SESS` variants).
+
+The digest is computed over the entity bytes, i.e. after any transfer framing
+has been removed and before any content decoding. Streaming request bodies are
+spooled so they can be replayed on the authenticated request: up to 1 MiB is
+kept in memory and larger bodies are written to a temporary file rather than
+being collected into memory without bound.
+
+When the server returns an `Authentication-Info` header with an `rspauth`
+value, HTTPX verifies it once the response entity has been fully consumed.
+The result is exposed as `response.digest_auth_verified`, which is one of
+`"verified"`, `"failed"` or `"unverified"`. Closing a streamed response before
+it is fully consumed can only produce `"unverified"`, never a false pass, and
+a failed verification raises `httpx.DigestAuthError`:
+
+```pycon
+>>> client = httpx.Client(auth=httpx.DigestAuth("olivia", "secret"))
+>>> response = client.post("https://example.org/upload", content=b"...")
+>>> response.digest_auth_verified
+'verified'
 ```
 
 ## NetRC authentication
