@@ -415,6 +415,35 @@ with additional API for accessing cookies by their domain or path.
 {'cookies': {'cookie_on_domain': 'hello, there!'}}
 ```
 
+### Cookie partitions
+
+When a single client is shared between independent tasks, you can keep their
+cookies separate by passing a stable `cookie_partition` identifier to a
+request. Each partition has its own cookie store on the client, so cookies
+set for the same domain and path never leak between tasks. The partition key
+is preserved across redirects and authentication retries, while the usual
+domain, path, `Secure` and expiry rules continue to apply within each
+partition. Requests without a partition key keep using the client's default
+cookie jar.
+
+```pycon
+>>> client = httpx.Client()
+>>> client.cookies.set('session', 'alpha', domain='example.org', partition_key='task-a')
+>>> client.cookies.set('session', 'beta', domain='example.org', partition_key='task-b')
+>>> client.get('http://example.org/cookies', cookie_partition='task-a').json()
+{'cookies': {'session': 'alpha'}}
+>>> client.get('http://example.org/cookies', cookie_partition='task-b').json()
+{'cookies': {'session': 'beta'}}
+```
+
+A partition can be imported, exported and cleared explicitly:
+
+```pycon
+>>> exported = client.cookies.export_partition('task-a')
+>>> client.cookies.import_partition('restored', exported)
+>>> client.cookies.clear_partition('restored')
+```
+
 ## Redirection and History
 
 By default, HTTPX will **not** follow redirects for all HTTP methods, although

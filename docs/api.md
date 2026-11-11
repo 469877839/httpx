@@ -97,12 +97,13 @@ what gets sent over the wire.*
 >>> response = client.send(request)
 ```
 
-* `def __init__(method, url, [params], [headers], [cookies], [content], [data], [files], [json], [stream])`
+* `def __init__(method, url, [params], [headers], [cookies], [content], [data], [files], [json], [stream], [cookie_partition])`
 * `.method` - **str**
 * `.url` - **URL**
 * `.content` - **byte**, **byte iterator**, or **byte async iterator**
 * `.headers` - **Headers**
 * `.cookies` - **Cookies**
+* `.cookie_partition` - **Optional[str]**
 
 ## `URL`
 
@@ -152,12 +153,17 @@ what gets sent over the wire.*
 
 * `def __init__(cookies: [dict, Cookies, CookieJar])`
 * `.jar` - **CookieJar**
-* `def extract_cookies(response)`
-* `def set_cookie_header(request)`
-* `def set(name, value, [domain], [path])`
-* `def get(name, [domain], [path])`
-* `def delete(name, [domain], [path])`
-* `def clear([domain], [path])`
+* `def extract_cookies(response, [partition_key])`
+* `def set_cookie_header(request, [partition_key])`
+* `def set(name, value, [domain], [path], [partition_key])`
+* `def get(name, [domain], [path], [partition_key])`
+* `def delete(name, [domain], [path], [partition_key])`
+* `def clear([domain], [path], [partition_key])`
+* `def partition(partition_key)` - **Cookies**
+* `def partition_keys()` - **list[str]**
+* `def export_partition(partition_key)` - **Cookies**
+* `def import_partition(partition_key, cookies)`
+* `def clear_partition(partition_key)`
 * *Standard mutable mapping interface*
 
 ## `Proxy`

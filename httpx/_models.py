@@ -394,11 +394,13 @@ class Request:
         json: typing.Any | None = None,
         stream: SyncByteStream | AsyncByteStream | None = None,
         extensions: RequestExtensions | None = None,
+        cookie_partition: str | None = None,
     ) -> None:
         self.method = method.upper()
         self.url = URL(url) if params is None else URL(url, params=params)
         self.headers = Headers(headers)
         self.extensions = {} if extensions is None else dict(extensions)
+        self.cookie_partition = cookie_partition
 
         if cookies:
             Cookies(cookies).set_cookie_header(self)
@@ -1079,6 +1081,11 @@ class Response:
 class Cookies(typing.MutableMapping[str, str]):
     """
     HTTP Cookies, as a mutable mapping.
+
+    Cookies may optionally be partitioned by an explicit partition key,
+    allowing multiple independent cookie stores to be managed within a
+    single `Cookies` instance. Operations that do not specify a partition
+    key continue to use the default, unpartitioned cookie jar.
     """
 
     def __init__(self, cookies: CookieTypes | None = None) -> None:
@@ -1098,23 +1105,103 @@ class Cookies(typing.MutableMapping[str, str]):
         else:
             self.jar = cookies
 
-    def extract_cookies(self, response: Response) -> None:
+        self._partition_jars: dict[str, CookieJar] = {}
+
+    def _jar_for_partition(self, partition_key: str) -> CookieJar:
+        """
+        Return the `CookieJar` for the given partition key,
+        creating it if it does not yet exist.
+        """
+        return self._partition_jars.setdefault(partition_key, CookieJar())
+
+    def _jar(self, partition_key: str | None) -> CookieJar:
+        """
+        Return the `CookieJar` to use for the given partition key,
+        or the default jar when no partition key is given.
+        """
+        if partition_key is None:
+            return self.jar
+        return self._jar_for_partition(partition_key)
+
+    def partition(self, partition_key: str) -> Cookies:
+        """
+        Return a `Cookies` instance exposing the cookie jar for the
+        given partition key. Changes made through the returned instance
+        are reflected in the partition of this `Cookies` instance.
+        """
+        partitioned = Cookies()
+        partitioned.jar = self._jar_for_partition(partition_key)
+        partitioned._partition_jars = self._partition_jars
+        return partitioned
+
+    def partition_keys(self) -> list[str]:
+        """
+        Return the partition keys that currently have cookies stored.
+        """
+        return [
+            key for key, jar in self._partition_jars.items() if len(jar) > 0
+        ]
+
+    def export_partition(self, partition_key: str) -> Cookies:
+        """
+        Return a standalone `Cookies` instance containing copies of all
+        cookies stored under the given partition key.
+        """
+        exported = Cookies()
+        for cookie in self._jar_for_partition(partition_key):
+            exported.jar.set_cookie(cookie)
+        return exported
+
+    def import_partition(
+        self, partition_key: str, cookies: CookieTypes | None
+    ) -> None:
+        """
+        Import cookies into the given partition key. The imported cookies
+        are merged into any cookies already stored in that partition.
+        """
+        if cookies is None:
+            return
+        imported = Cookies(cookies)
+        target_jar = self._jar_for_partition(partition_key)
+        for cookie in imported.jar:
+            target_jar.set_cookie(cookie)
+
+    def clear_partition(self, partition_key: str) -> None:
+        """
+        Delete all cookies stored under the given partition key.
+        """
+        self.clear(partition_key=partition_key)
+
+    def extract_cookies(
+        self, response: Response, partition_key: str | None = None
+    ) -> None:
         """
         Loads any cookies based on the response `Set-Cookie` headers.
         """
         urllib_response = self._CookieCompatResponse(response)
         urllib_request = self._CookieCompatRequest(response.request)
 
-        self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
+        jar = self._jar(partition_key)
+        jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
 
-    def set_cookie_header(self, request: Request) -> None:
+    def set_cookie_header(
+        self, request: Request, partition_key: str | None = None
+    ) -> None:
         """
         Sets an appropriate 'Cookie:' HTTP header on the `Request`.
         """
         urllib_request = self._CookieCompatRequest(request)
-        self.jar.add_cookie_header(urllib_request)
+        jar = self._jar(partition_key)
+        jar.add_cookie_header(urllib_request)
 
-    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+    def set(
+        self,
+        name: str,
+        value: str,
+        domain: str = "",
+        path: str = "/",
+        partition_key: str | None = None,
+    ) -> None:
         """
         Set a cookie value by name. May optionally include domain and path.
         """
@@ -1138,7 +1225,8 @@ class Cookies(typing.MutableMapping[str, str]):
             "rfc2109": False,
         }
         cookie = Cookie(**kwargs)  # type: ignore
-        self.jar.set_cookie(cookie)
+        jar = self._jar(partition_key)
+        jar.set_cookie(cookie)
 
     def get(  # type: ignore
         self,
@@ -1146,13 +1234,15 @@ class Cookies(typing.MutableMapping[str, str]):
         default: str | None = None,
         domain: str | None = None,
         path: str | None = None,
+        partition_key: str | None = None,
     ) -> str | None:
         """
         Get a cookie by name. May optionally include domain and path
         in order to specify exactly which cookie to retrieve.
         """
         value = None
-        for cookie in self.jar:
+        jar = self._jar(partition_key)
+        for cookie in jar:
             if cookie.name == name:
                 if domain is None or cookie.domain == domain:
                     if path is None or cookie.path == path:
@@ -1170,37 +1260,52 @@ class Cookies(typing.MutableMapping[str, str]):
         name: str,
         domain: str | None = None,
         path: str | None = None,
+        partition_key: str | None = None,
     ) -> None:
         """
         Delete a cookie by name. May optionally include domain and path
         in order to specify exactly which cookie to delete.
         """
+        jar = self._jar(partition_key)
         if domain is not None and path is not None:
-            return self.jar.clear(domain, path, name)
+            return jar.clear(domain, path, name)
 
         remove = [
             cookie
-            for cookie in self.jar
+            for cookie in jar
             if cookie.name == name
             and (domain is None or cookie.domain == domain)
             and (path is None or cookie.path == path)
         ]
 
         for cookie in remove:
-            self.jar.clear(cookie.domain, cookie.path, cookie.name)
+            jar.clear(cookie.domain, cookie.path, cookie.name)
 
-    def clear(self, domain: str | None = None, path: str | None = None) -> None:
+    def clear(
+        self,
+        domain: str | None = None,
+        path: str | None = None,
+        partition_key: str | None = None,
+    ) -> None:
         """
         Delete all cookies. Optionally include a domain and path in
         order to only delete a subset of all the cookies.
         """
+        if partition_key is not None:
+            jar = self._jar_for_partition(partition_key)
+            if domain is None and path is None:
+                jar.clear()
+                self._partition_jars.pop(partition_key, None)
+                return
+        else:
+            jar = self.jar
         args = []
         if domain is not None:
             args.append(domain)
         if path is not None:
             assert domain is not None
             args.append(path)
-        self.jar.clear(*args)
+        jar.clear(*args)
 
     def update(self, cookies: CookieTypes | None = None) -> None:  # type: ignore
         cookies = Cookies(cookies)

@@ -351,6 +351,7 @@ class BaseClient:
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         extensions: RequestExtensions | None = None,
+        cookie_partition: str | None = None,
     ) -> Request:
         """
         Build and return a request instance.
@@ -358,6 +359,11 @@ class BaseClient:
         * The `params`, `headers` and `cookies` arguments
         are merged with any values set on the client.
         * The `url` argument is merged with any `base_url` set on the client.
+        * The `cookie_partition` argument selects an explicit cookie partition
+        on the client. Cookies stored in that partition are attached to the
+        request and any `Set-Cookie` responses are stored back into it,
+        including across redirects and authentication retries. When `None`,
+        the client's default cookie jar is used.
 
         See also: [Request instances][0]
 
@@ -365,7 +371,7 @@ class BaseClient:
         """
         url = self._merge_url(url)
         headers = self._merge_headers(headers)
-        cookies = self._merge_cookies(cookies)
+        cookies = self._merge_cookies(cookies, cookie_partition)
         params = self._merge_queryparams(params)
         extensions = {} if extensions is None else extensions
         if "timeout" not in extensions:
@@ -386,6 +392,7 @@ class BaseClient:
             headers=headers,
             cookies=cookies,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def _merge_url(self, url: URL | str) -> URL:
@@ -410,13 +417,25 @@ class BaseClient:
             return self.base_url.copy_with(raw_path=merge_raw_path)
         return merge_url
 
-    def _merge_cookies(self, cookies: CookieTypes | None = None) -> CookieTypes | None:
+    def _merge_cookies(
+        self,
+        cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
+    ) -> CookieTypes | None:
         """
         Merge a cookies argument together with any cookies on the client,
         to create the cookies used for the outgoing request.
+
+        When a `cookie_partition` is given, the cookies stored in that
+        partition are used instead of the client's default cookie jar.
         """
-        if cookies or self.cookies:
-            merged_cookies = Cookies(self.cookies)
+        client_cookies: CookieTypes | None = (
+            self.cookies
+            if cookie_partition is None
+            else self.cookies.partition(cookie_partition)
+        )
+        if cookies or client_cookies:
+            merged_cookies = Cookies(client_cookies)
             merged_cookies.update(cookies)
             return merged_cookies
         return cookies
@@ -481,7 +500,12 @@ class BaseClient:
         url = self._redirect_url(request, response)
         headers = self._redirect_headers(request, url, method)
         stream = self._redirect_stream(request, method)
-        cookies = Cookies(self.cookies)
+        cookie_partition = request.cookie_partition
+        cookies = Cookies(
+            self.cookies
+            if cookie_partition is None
+            else self.cookies.partition(cookie_partition)
+        )
         return Request(
             method=method,
             url=url,
@@ -489,6 +513,7 @@ class BaseClient:
             cookies=cookies,
             stream=stream,
             extensions=request.extensions,
+            cookie_partition=cookie_partition,
         )
 
     def _redirect_method(self, request: Request, response: Response) -> str:
@@ -780,6 +805,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -821,6 +847,7 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -837,6 +864,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -864,6 +892,7 @@ class Client(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
         response = self.send(
             request=request,
@@ -934,9 +963,11 @@ class Client(BaseClient):
         follow_redirects: bool,
         history: list[Response],
     ) -> Response:
+        cookie_partition = request.cookie_partition
         auth_flow = auth.sync_auth_flow(request)
         try:
             request = next(auth_flow)
+            request.cookie_partition = cookie_partition
 
             while True:
                 response = self._send_handling_redirects(
@@ -950,6 +981,7 @@ class Client(BaseClient):
                     except StopIteration:
                         return response
 
+                    next_request.cookie_partition = cookie_partition
                     response.history = list(history)
                     response.read()
                     request = next_request
@@ -1019,7 +1051,7 @@ class Client(BaseClient):
         response.stream = BoundSyncStream(
             response.stream, response=response, start=start
         )
-        self.cookies.extract_cookies(response)
+        self.cookies.extract_cookies(response, partition_key=request.cookie_partition)
         response.default_encoding = self._default_encoding
 
         logger.info(
@@ -1040,6 +1072,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1060,6 +1093,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def options(
@@ -1069,6 +1103,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1089,6 +1124,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def head(
@@ -1098,6 +1134,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1118,6 +1155,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def post(
@@ -1131,6 +1169,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1155,6 +1194,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def put(
@@ -1168,6 +1208,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1192,6 +1233,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def patch(
@@ -1205,6 +1247,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1229,6 +1272,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def delete(
@@ -1238,6 +1282,7 @@ class Client(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1258,6 +1303,7 @@ class Client(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     def close(self) -> None:
@@ -1494,6 +1540,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1536,6 +1583,7 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
 
@@ -1552,6 +1600,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1579,6 +1628,7 @@ class AsyncClient(BaseClient):
             cookies=cookies,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
         response = await self.send(
             request=request,
@@ -1649,9 +1699,11 @@ class AsyncClient(BaseClient):
         follow_redirects: bool,
         history: list[Response],
     ) -> Response:
+        cookie_partition = request.cookie_partition
         auth_flow = auth.async_auth_flow(request)
         try:
             request = await auth_flow.__anext__()
+            request.cookie_partition = cookie_partition
 
             while True:
                 response = await self._send_handling_redirects(
@@ -1665,6 +1717,7 @@ class AsyncClient(BaseClient):
                     except StopAsyncIteration:
                         return response
 
+                    next_request.cookie_partition = cookie_partition
                     response.history = list(history)
                     await response.aread()
                     request = next_request
@@ -1734,7 +1787,7 @@ class AsyncClient(BaseClient):
         response.stream = BoundAsyncStream(
             response.stream, response=response, start=start
         )
-        self.cookies.extract_cookies(response)
+        self.cookies.extract_cookies(response, partition_key=request.cookie_partition)
         response.default_encoding = self._default_encoding
 
         logger.info(
@@ -1755,6 +1808,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1775,6 +1829,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def options(
@@ -1784,6 +1839,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1804,6 +1860,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def head(
@@ -1813,6 +1870,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1833,6 +1891,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def post(
@@ -1846,6 +1905,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1870,6 +1930,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def put(
@@ -1883,6 +1944,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1907,6 +1969,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def patch(
@@ -1920,6 +1983,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1944,6 +2008,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def delete(
@@ -1953,6 +2018,7 @@ class AsyncClient(BaseClient):
         params: QueryParamTypes | None = None,
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
+        cookie_partition: str | None = None,
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
@@ -1973,6 +2039,7 @@ class AsyncClient(BaseClient):
             follow_redirects=follow_redirects,
             timeout=timeout,
             extensions=extensions,
+            cookie_partition=cookie_partition,
         )
 
     async def aclose(self) -> None:
