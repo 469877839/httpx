@@ -61,21 +61,48 @@ class DeflateDecoder(ContentDecoder):
     """
 
     def __init__(self) -> None:
-        self.first_attempt = True
+        self.seen_data = False
         self.decompressor = zlib.decompressobj()
+        self._fallback: typing.Any = None
+        self._buffer = bytearray()
 
     def decode(self, data: bytes) -> bytes:
-        was_first_attempt = self.first_attempt
-        self.first_attempt = False
+        if not data:
+            return b""
+        self.seen_data = True
+        # Retain the wire data so the raw-deflate fallback can replay the
+        # whole stream, including when the zlib header check does not fail
+        # until a later chunk has been fed in.
+        self._buffer.extend(data)
         try:
-            return self.decompressor.decompress(data)
+            result = self.decompressor.decompress(data)
         except zlib.error as exc:
-            if was_first_attempt:
-                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-                return self.decode(data)
+            if self._fallback is None:
+                # The zlib-wrapped attempt failed (possibly after accepting
+                # the first chunk); replay the buffer as raw deflate.
+                self._fallback = zlib.decompressobj(-zlib.MAX_WBITS)
+                self.decompressor = self._fallback
+                buffered = bytes(self._buffer)
+                self._buffer = bytearray()
+                return self.decode(buffered)
             raise DecodingError(str(exc)) from exc
+        if self.decompressor.eof:
+            self._buffer.clear()
+        return result
 
     def flush(self) -> bytes:
+        if self.seen_data and not self.decompressor.eof:
+            # A complete zlib stream always reports end-of-stream. If we never
+            # reached it, retry the buffered input as a raw deflate stream.
+            retry = zlib.decompressobj(-zlib.MAX_WBITS)
+            try:
+                result = retry.decompress(bytes(self._buffer)) + retry.flush()
+            except zlib.error as exc:
+                raise DecodingError(str(exc)) from exc
+            if not retry.eof:
+                raise DecodingError("Incomplete deflate stream")
+            self.decompressor = retry
+            return result
         try:
             return self.decompressor.flush()
         except zlib.error as exc:  # pragma: no cover
@@ -90,9 +117,13 @@ class GZipDecoder(ContentDecoder):
     """
 
     def __init__(self) -> None:
+        self.seen_data = False
         self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
 
     def decode(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self.seen_data = True
         try:
             return self.decompressor.decompress(data)
         except zlib.error as exc:
@@ -100,9 +131,12 @@ class GZipDecoder(ContentDecoder):
 
     def flush(self) -> bytes:
         try:
-            return self.decompressor.flush()
+            result = self.decompressor.flush()
         except zlib.error as exc:  # pragma: no cover
             raise DecodingError(str(exc)) from exc
+        if self.seen_data and not self.decompressor.eof:
+            raise DecodingError("Incomplete gzip stream")
+        return result
 
 
 class BrotliDecoder(ContentDecoder):

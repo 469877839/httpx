@@ -1,3 +1,4 @@
+import contextlib
 import json
 import pickle
 import typing
@@ -764,6 +765,193 @@ async def test_cannot_aread_after_response_closed():
     await response.aclose()
     with pytest.raises(httpx.StreamClosed):
         await response.aread()
+
+
+class CountingSyncByteStream(httpx.SyncByteStream):
+    def __init__(self, chunks: typing.Iterable[bytes]) -> None:
+        self._chunks = list(chunks)
+        self.close_count = 0
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        yield from self._chunks
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _AsyncChunkIterator:
+    """An async iterator class, avoiding garbage-collected async generators."""
+
+    def __init__(self, chunks: typing.Iterable[bytes]) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> "_AsyncChunkIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class CountingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: typing.Iterable[bytes]) -> None:
+        self._chunks = list(chunks)
+        self.close_count = 0
+
+    def __aiter__(self) -> _AsyncChunkIterator:
+        return _AsyncChunkIterator(self._chunks)
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+@pytest.mark.parametrize(
+    "read_method",
+    ["read", "iter_bytes", "iter_text", "iter_lines"],
+)
+def test_stream_closed_once_on_sync_decoding_error(read_method):
+    stream = CountingSyncByteStream([b"\x1f\x8b\x08garbage"])
+    response = httpx.Response(
+        200,
+        headers=[(b"Content-Encoding", b"gzip")],
+        stream=stream,
+    )
+
+    with pytest.raises(httpx.DecodingError):
+        if read_method == "read":
+            response.read()
+        else:
+            list(getattr(response, read_method)())
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "read_method",
+    ["aread", "aiter_bytes", "aiter_text", "aiter_lines"],
+)
+async def test_stream_closed_once_on_async_decoding_error(read_method):
+    stream = CountingAsyncByteStream([b"\x1f\x8b\x08garbage"])
+    response = httpx.Response(
+        200,
+        headers=[(b"Content-Encoding", b"gzip")],
+        stream=stream,
+    )
+
+    with pytest.raises(httpx.DecodingError):
+        if read_method == "aread":
+            await response.aread()
+        else:
+            async for _ in getattr(response, read_method)():
+                pass
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+
+class FailingSyncByteStream(httpx.SyncByteStream):
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        yield b"first"
+        raise RuntimeError("boom")
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class _FailingAsyncChunkIterator:
+    def __init__(self) -> None:
+        self._first_yielded = False
+
+    def __aiter__(self) -> "_FailingAsyncChunkIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if not self._first_yielded:
+            self._first_yielded = True
+            return b"first"
+        raise RuntimeError("boom")
+
+
+class FailingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        return _FailingAsyncChunkIterator()
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+def test_stream_closed_when_sync_iteration_raises():
+    stream = FailingSyncByteStream()
+    response = httpx.Response(200, stream=stream)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        list(response.iter_raw())
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_stream_closed_when_async_iteration_raises():
+    stream = FailingAsyncByteStream()
+    response = httpx.Response(200, stream=stream)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async for _ in response.aiter_raw():
+            pass
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+
+def test_stream_closed_once_on_sync_abandon_then_close():
+    stream = CountingSyncByteStream([b"a", b"b", b"c"])
+    response = httpx.Response(200, stream=stream)
+
+    iterator = response.iter_raw()
+    assert next(iterator) == b"a"
+    iterator.close()
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+    # Closing again must not invoke the underlying stream a second time.
+    response.close()
+    assert stream.close_count == 1
+
+    with pytest.raises(httpx.StreamConsumed):
+        response.read()
+    assert stream.close_count == 1
+
+
+@pytest.mark.anyio
+async def test_stream_closed_once_on_async_abandon_then_aclose():
+    stream = CountingAsyncByteStream([b"a", b"b", b"c"])
+    response = httpx.Response(200, stream=stream)
+
+    iterator = response.aiter_raw().__aiter__()
+    assert await iterator.__anext__() == b"a"
+    await iterator.aclose()
+
+    assert response.is_closed
+    assert stream.close_count == 1
+
+    await response.aclose()
+    assert stream.close_count == 1
+
+    with pytest.raises(httpx.StreamConsumed):
+        await response.aread()
+    assert stream.close_count == 1
 
 
 @pytest.mark.anyio

@@ -894,15 +894,21 @@ class Response:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
-                for raw_bytes in self.iter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                raw_iter = self.iter_raw()
+                try:
+                    for raw_bytes in raw_iter:
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+                finally:
+                    # Ensure the underlying raw stream is closed deterministically,
+                    # including if decoding raises or iteration is abandoned.
+                    raw_iter.close()
 
     def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
         """
@@ -913,24 +919,36 @@ class Response:
         decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
-            for byte_content in self.iter_bytes():
-                text_content = decoder.decode(byte_content)
+            bytes_iter = self.iter_bytes()
+            try:
+                for byte_content in bytes_iter:
+                    text_content = decoder.decode(byte_content)
+                    for chunk in chunker.decode(text_content):
+                        yield chunk
+                text_content = decoder.flush()
                 for chunk in chunker.decode(text_content):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
                     yield chunk
-            text_content = decoder.flush()
-            for chunk in chunker.decode(text_content):
-                yield chunk  # pragma: no cover
-            for chunk in chunker.flush():
-                yield chunk
+            finally:
+                # Ensure the underlying raw stream is closed deterministically,
+                # including if decoding raises or iteration is abandoned.
+                bytes_iter.close()
 
     def iter_lines(self) -> typing.Iterator[str]:
         decoder = LineDecoder()
         with request_context(request=self._request):
-            for text in self.iter_text():
-                for line in decoder.decode(text):
+            text_iter = self.iter_text()
+            try:
+                for text in text_iter:
+                    for line in decoder.decode(text):
+                        yield line
+                for line in decoder.flush():
                     yield line
-            for line in decoder.flush():
-                yield line
+            finally:
+                # Ensure the underlying raw stream is closed deterministically,
+                # including if decoding raises or iteration is abandoned.
+                text_iter.close()
 
     def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
         """
@@ -948,15 +966,18 @@ class Response:
         chunker = ByteChunker(chunk_size=chunk_size)
 
         with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
+            try:
+                for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
+
+                for chunk in chunker.flush():
                     yield chunk
-
-        for chunk in chunker.flush():
-            yield chunk
-
-        self.close()
+            finally:
+                # Ensure the stream is closed if the iterator is abandoned
+                # part-way through, or if an error occurs while iterating.
+                self.close()
 
     def close(self) -> None:
         """
@@ -994,15 +1015,21 @@ class Response:
             decoder = self._get_content_decoder()
             chunker = ByteChunker(chunk_size=chunk_size)
             with request_context(request=self._request):
-                async for raw_bytes in self.aiter_raw():
-                    decoded = decoder.decode(raw_bytes)
+                raw_iter = self.aiter_raw()
+                try:
+                    async for raw_bytes in raw_iter:
+                        decoded = decoder.decode(raw_bytes)
+                        for chunk in chunker.decode(decoded):
+                            yield chunk
+                    decoded = decoder.flush()
                     for chunk in chunker.decode(decoded):
+                        yield chunk  # pragma: no cover
+                    for chunk in chunker.flush():
                         yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+                finally:
+                    # Ensure the underlying raw stream is closed deterministically,
+                    # including if decoding raises or iteration is abandoned.
+                    await raw_iter.aclose()
 
     async def aiter_text(
         self, chunk_size: int | None = None
@@ -1015,24 +1042,36 @@ class Response:
         decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
-            async for byte_content in self.aiter_bytes():
-                text_content = decoder.decode(byte_content)
+            bytes_iter = self.aiter_bytes()
+            try:
+                async for byte_content in bytes_iter:
+                    text_content = decoder.decode(byte_content)
+                    for chunk in chunker.decode(text_content):
+                        yield chunk
+                text_content = decoder.flush()
                 for chunk in chunker.decode(text_content):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
                     yield chunk
-            text_content = decoder.flush()
-            for chunk in chunker.decode(text_content):
-                yield chunk  # pragma: no cover
-            for chunk in chunker.flush():
-                yield chunk
+            finally:
+                # Ensure the underlying raw stream is closed deterministically,
+                # including if decoding raises or iteration is abandoned.
+                await bytes_iter.aclose()
 
     async def aiter_lines(self) -> typing.AsyncIterator[str]:
         decoder = LineDecoder()
         with request_context(request=self._request):
-            async for text in self.aiter_text():
-                for line in decoder.decode(text):
+            text_iter = self.aiter_text()
+            try:
+                async for text in text_iter:
+                    for line in decoder.decode(text):
+                        yield line
+                for line in decoder.flush():
                     yield line
-            for line in decoder.flush():
-                yield line
+            finally:
+                # Ensure the underlying raw stream is closed deterministically,
+                # including if decoding raises or iteration is abandoned.
+                await text_iter.aclose()
 
     async def aiter_raw(
         self, chunk_size: int | None = None
@@ -1052,15 +1091,18 @@ class Response:
         chunker = ByteChunker(chunk_size=chunk_size)
 
         with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
+            try:
+                async for raw_stream_bytes in self.stream:
+                    self._num_bytes_downloaded += len(raw_stream_bytes)
+                    for chunk in chunker.decode(raw_stream_bytes):
+                        yield chunk
+
+                for chunk in chunker.flush():
                     yield chunk
-
-        for chunk in chunker.flush():
-            yield chunk
-
-        await self.aclose()
+            finally:
+                # Ensure the stream is closed if the iterator is abandoned
+                # part-way through, or if an error occurs while iterating.
+                await self.aclose()
 
     async def aclose(self) -> None:
         """

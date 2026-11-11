@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import typing
 import zlib
@@ -353,3 +354,219 @@ def test_invalid_content_encoding_header():
         content=body,
     )
     assert response.content == body
+
+
+# A short payload exercising multibyte characters, CRLF split points and a
+# final segment with no trailing newline.
+CONSISTENCY_BODY = "aé中\r\nx\ry\nz end".encode("utf-8")
+
+
+def _gzip(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    return compressor.compress(data) + compressor.flush()
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
+
+
+def _partitions(data: bytes):
+    """All contiguous 1- and 2-cut partitions, plus empty-chunk interleaves."""
+    n = len(data)
+    for i in range(1, n):
+        yield [data[:i], data[i:]]
+        for j in range(i + 1, n):
+            yield [data[:i], data[i:j], data[j:]]
+    for i in range(0, n + 1):
+        yield [data[:i], b"", data[i:]]
+    yield [b"", data]
+    yield [data, b""]
+
+
+CONSISTENCY_CASES = [
+    ("identity", b"identity", CONSISTENCY_BODY, lambda b: b),
+    ("gzip", b"gzip", _gzip(CONSISTENCY_BODY), gzip.decompress),
+    (
+        "deflate_zlib",
+        b"deflate",
+        zlib.compress(CONSISTENCY_BODY, 9),
+        zlib.decompress,
+    ),
+    (
+        "deflate_raw",
+        b"deflate",
+        _raw_deflate(CONSISTENCY_BODY),
+        lambda b: zlib.decompress(b, -zlib.MAX_WBITS),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", CONSISTENCY_CASES, ids=lambda case: case[0])
+def test_chunking_consistency_sync(case):
+    name, encoding, wire, reference_decode = case
+    reference_bytes = reference_decode(wire)
+    reference_text = reference_bytes.decode("utf-8", errors="replace")
+    reference_lines = reference_text.splitlines()
+
+    for chunks in _partitions(wire):
+        # The same response body must decode identically regardless of how the
+        # underlying raw stream chooses to chunk it. Each read interface gets a
+        # fresh response, since a streaming response can only be consumed once.
+        def fresh_response():
+            return httpx.Response(
+                200,
+                headers=[(b"Content-Encoding", encoding)],
+                content=iter(list(chunks)),
+            )
+
+        assert b"".join(fresh_response().iter_raw()) == wire
+        assert b"".join(fresh_response().iter_bytes()) == reference_bytes
+        assert "".join(fresh_response().iter_text()) == reference_text
+        assert list(fresh_response().iter_lines()) == reference_lines
+
+        response = fresh_response()
+        assert response.read() == reference_bytes
+        assert response.text == reference_text
+
+
+class _AsyncChunkIterator:
+    """An async iterator class, avoiding garbage-collected async generators."""
+
+    def __init__(self, chunks: typing.Iterable[bytes]) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> "_AsyncChunkIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _AsyncChunks(httpx.AsyncByteStream):
+    def __init__(self, chunks: typing.Iterable[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> _AsyncChunkIterator:
+        return _AsyncChunkIterator(self._chunks)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", CONSISTENCY_CASES, ids=lambda case: case[0])
+async def test_chunking_consistency_async(case):
+    name, encoding, wire, reference_decode = case
+    reference_bytes = reference_decode(wire)
+    reference_text = reference_bytes.decode("utf-8", errors="replace")
+    reference_lines = reference_text.splitlines()
+
+    for chunks in _partitions(wire):
+        def fresh_response():
+            return httpx.Response(
+                200,
+                headers=[(b"Content-Encoding", encoding)],
+                stream=_AsyncChunks(chunks),
+            )
+
+        assert b"".join([part async for part in fresh_response().aiter_raw()]) == wire
+        assert b"".join(
+            [part async for part in fresh_response().aiter_bytes()]
+        ) == reference_bytes
+        assert "".join(
+            [part async for part in fresh_response().aiter_text()]
+        ) == reference_text
+        assert [part async for part in fresh_response().aiter_lines()] == (
+            reference_lines
+        )
+
+        response = fresh_response()
+        assert await response.aread() == reference_bytes
+        assert response.text == reference_text
+
+
+@pytest.mark.parametrize(
+    ["encoding", "compressed"],
+    [
+        (b"gzip", _gzip(CONSISTENCY_BODY)),
+        (b"deflate", zlib.compress(CONSISTENCY_BODY, 9)),
+        (b"deflate", _raw_deflate(CONSISTENCY_BODY)),
+    ],
+)
+@pytest.mark.parametrize("cut", [1, 3, 7])
+def test_truncated_compressed_stream_raises(encoding, compressed, cut):
+    # The stdlib rejects truncated streams; httpx must do the same at flush,
+    # regardless of how the remaining bytes are partitioned.
+    truncated = compressed[:-cut]
+    for chunks in _partitions(truncated):
+        response = httpx.Response(
+            200,
+            headers=[(b"Content-Encoding", encoding)],
+            content=iter(chunks),
+        )
+        with pytest.raises(httpx.DecodingError):
+            response.read()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ["encoding", "compressed"],
+    [
+        (b"gzip", _gzip(CONSISTENCY_BODY)),
+        (b"deflate", zlib.compress(CONSISTENCY_BODY, 9)),
+    ],
+)
+async def test_truncated_compressed_stream_raises_async(encoding, compressed):
+    truncated = compressed[:-3]
+    response = httpx.Response(
+        200,
+        headers=[(b"Content-Encoding", encoding)],
+        stream=_AsyncChunks([truncated[i - 1 : i] for i in range(1, len(truncated))]),
+    )
+    with pytest.raises(httpx.DecodingError):
+        await response.aread()
+
+
+def test_deflate_fallback_when_header_error_is_delayed():
+    # Raw deflate streams can have a first byte that passes the zlib header
+    # check; the failure only surfaces when a later chunk is fed in. The
+    # fallback must still kick in regardless of chunk boundaries.
+    body = CONSISTENCY_BODY
+    compressed = _raw_deflate(body)
+    first = zlib.decompressobj()
+    try:
+        first.decompress(compressed[:1])
+        delayed = True
+    except zlib.error:
+        delayed = False
+
+    for chunks in _partitions(compressed):
+        response = httpx.Response(
+            200,
+            headers=[(b"Content-Encoding", b"deflate")],
+            content=iter(list(chunks)),
+        )
+        assert response.read() == body
+
+    assert delayed, "test fixture no longer exercises the delayed-error path"
+
+
+def test_empty_stream_with_compression_headers():
+    # An empty body is not a truncated stream and must remain acceptable.
+    for encoding in (b"gzip", b"deflate"):
+        response = httpx.Response(
+            200, headers=[(b"Content-Encoding", encoding)], content=b""
+        )
+        assert response.read() == b""
+
+
+def test_illegal_utf8_bytes_are_replaced_consistently():
+    body = b"a\xff\xfe b"
+    reference = body.decode("utf-8", errors="replace")
+    for chunks in _partitions(body):
+        response = httpx.Response(200, content=iter(list(chunks)))
+        assert "".join(response.iter_text()) == reference
+
+        response = httpx.Response(200, content=iter(list(chunks)))
+        assert list(response.iter_lines()) == reference.splitlines()

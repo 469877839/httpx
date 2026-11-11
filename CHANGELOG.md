@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* Truncated `gzip`/`deflate` response bodies now raise `DecodingError` instead of silently returning partial content.
+* The `deflate` raw-stream fallback now applies regardless of how the body is chunked, including when the zlib header check only fails after the first chunk.
+* Response streams are now closed deterministically when decoding fails part-way through or iteration is abandoned, for both sync and async usage.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.
