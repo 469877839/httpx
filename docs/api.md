@@ -48,6 +48,27 @@
     :members: headers cookies params auth request get head options post put patch delete stream build_request send aclose
 
 
+## `RequestRecorder`
+
+An optional, in-memory recorder of the logical requests issued by a client.
+See the [Request recorder](advanced/recorder.md) guide for details.
+
+::: httpx.RequestRecorder
+    :docstring:
+    :members: records clear
+
+## `RequestRecord`
+
+::: httpx.RequestRecord
+    :docstring:
+    :members: attempts auth_steps
+
+## `RequestAttempt`
+
+::: httpx.RequestAttempt
+    :docstring:
+
+
 ## `Response`
 
 *An HTTP response.*

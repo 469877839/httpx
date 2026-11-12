@@ -25,6 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from ._auth import Auth  # noqa: F401
     from ._config import Proxy, Timeout  # noqa: F401
     from ._models import Cookies, Headers, Request  # noqa: F401
+    from ._recorder import RequestRecorder  # noqa: F401
     from ._urls import URL, QueryParams  # noqa: F401
 
 
@@ -83,6 +84,8 @@ FileTypes = Union[
     Tuple[Optional[str], FileContent, Optional[str], Mapping[str, str]],
 ]
 RequestFiles = Union[Mapping[str, FileTypes], Sequence[Tuple[str, FileTypes]]]
+
+RecorderTypes = Optional["RequestRecorder"]
 
 RequestExtensions = Mapping[str, Any]
 

@@ -33,6 +33,7 @@ nav:
         - Timeouts: 'advanced/timeouts.md'
         - Resource Limits: 'advanced/resource-limits.md'
         - Event Hooks: 'advanced/event-hooks.md'
+        - Request Recorder: 'advanced/recorder.md'
         - Transports: 'advanced/transports.md'
         - Text Encodings: 'advanced/text-encodings.md'
         - Extensions: 'advanced/extensions.md'

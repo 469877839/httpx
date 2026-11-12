@@ -27,6 +27,14 @@ from ._exceptions import (
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._recorder import (
+    AttemptOutcome,
+    AttemptTrigger,
+    AuthStepOutcome,
+    RequestAttempt,
+    RequestRecord,
+    RequestRecorder,
+)
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -38,6 +46,7 @@ from ._types import (
     HeaderTypes,
     ProxyTypes,
     QueryParamTypes,
+    RecorderTypes,
     RequestContent,
     RequestData,
     RequestExtensions,
@@ -200,8 +209,14 @@ class BaseClient:
         base_url: URL | str = "",
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        recorder: RecorderTypes = None,
     ) -> None:
         event_hooks = {} if event_hooks is None else event_hooks
+
+        if recorder is not None and not isinstance(recorder, RequestRecorder):
+            raise TypeError(
+                'Invalid "recorder" argument, expected a RequestRecorder instance.'
+            )
 
         self._base_url = self._enforce_trailing_slash(URL(base_url))
 
@@ -218,6 +233,7 @@ class BaseClient:
         }
         self._trust_env = trust_env
         self._default_encoding = default_encoding
+        self._recorder = recorder
         self._state = ClientState.UNOPENED
 
     @property
@@ -268,6 +284,13 @@ class BaseClient:
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
         }
+
+    @property
+    def recorder(self) -> RequestRecorder | None:
+        """
+        The optional request recorder used by this client, if any.
+        """
+        return self._recorder
 
     @property
     def auth(self) -> Auth | None:
@@ -590,6 +613,20 @@ class BaseClient:
             )
             request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
 
+    def _record_read_error(self, record: RequestRecord, exc: BaseException) -> None:
+        """
+        Mark the latest attempt as having failed while its body was read.
+
+        Only an attempt that already produced a response can reach this point.
+        Attempts interrupted earlier keep their own, more precise boundary.
+        """
+        recorder = self._recorder
+        if recorder is None or not record.attempts:
+            return
+        attempt = record.attempts[-1]
+        if attempt.outcome is AttemptOutcome.RESPONSE:
+            recorder._finish_attempt(attempt, AttemptOutcome.READ_ERROR, exc=exc)
+
 
 class Client(BaseClient):
     """
@@ -634,6 +671,9 @@ class Client(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **recorder** - *(optional)* A `RequestRecorder` instance used to record the
+    logical requests issued by this client, including every network attempt and
+    the step that triggered it.
     """
 
     def __init__(
@@ -658,6 +698,7 @@ class Client(BaseClient):
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        recorder: RecorderTypes = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -671,6 +712,7 @@ class Client(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            recorder=recorder,
         )
 
         if http2:
@@ -911,11 +953,15 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        record = (
+            None if self._recorder is None else self._recorder._start_record(request)
+        )
         response = self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            record=record,
         )
         try:
             if not stream:
@@ -924,6 +970,8 @@ class Client(BaseClient):
             return response
 
         except BaseException as exc:
+            if record is not None:
+                self._record_read_error(record, exc)
             response.close()
             raise exc
 
@@ -933,27 +981,73 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        record: RequestRecord | None = None,
     ) -> Response:
+        recorder = self._recorder
         auth_flow = auth.sync_auth_flow(request)
+        auth_step = 0
         try:
-            request = next(auth_flow)
+            try:
+                request = next(auth_flow)
+            except BaseException as exc:
+                if recorder is not None and record is not None:
+                    recorder._record_auth_step(
+                        record,
+                        outcome=AuthStepOutcome.EXCEPTION,
+                        sequence=auth_step,
+                        exc=exc,
+                    )
+                raise
 
             while True:
                 response = self._send_handling_redirects(
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    history_start=len(history),
+                    record=record,
+                    auth_step=auth_step,
                 )
                 try:
                     try:
                         next_request = auth_flow.send(response)
                     except StopIteration:
+                        if recorder is not None and record is not None:
+                            recorder._record_auth_step(
+                                record,
+                                outcome=AuthStepOutcome.ENDED,
+                                sequence=auth_step,
+                                response=response,
+                            )
                         return response
+                    except BaseException as exc:
+                        if recorder is not None and record is not None:
+                            recorder._record_auth_step(
+                                record,
+                                outcome=AuthStepOutcome.EXCEPTION,
+                                sequence=auth_step,
+                                response=response,
+                                exc=exc,
+                            )
+                        raise
 
+                    if recorder is not None and record is not None:
+                        recorder._record_auth_step(
+                            record,
+                            outcome=AuthStepOutcome.CONTINUED,
+                            sequence=auth_step,
+                            response=response,
+                        )
                     response.history = list(history)
-                    response.read()
+                    try:
+                        response.read()
+                    except BaseException as exc:
+                        if record is not None:
+                            self._record_read_error(record, exc)
+                        raise
                     request = next_request
                     history.append(response)
+                    auth_step += 1
 
                 except BaseException as exc:
                     response.close()
@@ -966,7 +1060,11 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        history_start: int = 0,
+        record: RequestRecord | None = None,
+        auth_step: int = 0,
     ) -> Response:
+        recorder = self._recorder
         while True:
             if len(history) > self.max_redirects:
                 raise TooManyRedirects(
@@ -976,10 +1074,46 @@ class Client(BaseClient):
             for hook in self._event_hooks["request"]:
                 hook(request)
 
-            response = self._send_single_request(request)
+            attempt: RequestAttempt | None = None
+            if recorder is not None and record is not None:
+                if len(history) > history_start:
+                    trigger = AttemptTrigger.REDIRECT
+                    source_response: Response | None = history[-1]
+                    redirect_status: int | None = history[-1].status_code
+                elif auth_step > 0:
+                    trigger = AttemptTrigger.AUTH_CONTINUATION
+                    source_response = history[-1]
+                    redirect_status = None
+                else:
+                    trigger = AttemptTrigger.INITIAL
+                    source_response = None
+                    redirect_status = None
+                attempt = recorder._record_attempt(
+                    record,
+                    request,
+                    trigger=trigger,
+                    auth_step=auth_step,
+                    redirect_step=len(history) - history_start,
+                    response=source_response,
+                    redirect_status=redirect_status,
+                )
+            response = self._send_single_request(
+                request, record=record, attempt=attempt
+            )
             try:
                 for hook in self._event_hooks["response"]:
-                    hook(response)
+                    try:
+                        hook(response)
+                    except BaseException as exc:
+                        if recorder is not None and record is not None:
+                            assert attempt is not None
+                            recorder._finish_attempt(
+                                attempt,
+                                AttemptOutcome.HOOK_ERROR,
+                                response=response,
+                                exc=exc,
+                            )
+                        raise
                 response.history = list(history)
 
                 if not response.has_redirect_location:
@@ -989,7 +1123,12 @@ class Client(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    response.read()
+                    try:
+                        response.read()
+                    except BaseException as exc:
+                        if record is not None:
+                            self._record_read_error(record, exc)
+                        raise
                 else:
                     response.next_request = request
                     return response
@@ -998,10 +1137,16 @@ class Client(BaseClient):
                 response.close()
                 raise exc
 
-    def _send_single_request(self, request: Request) -> Response:
+    def _send_single_request(
+        self,
+        request: Request,
+        record: RequestRecord | None = None,
+        attempt: RequestAttempt | None = None,
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
+        recorder = self._recorder
         transport = self._transport_for_url(request.url)
         start = time.perf_counter()
 
@@ -1010,8 +1155,15 @@ class Client(BaseClient):
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        try:
+            with request_context(request=request):
+                response = transport.handle_request(request)
+        except BaseException as exc:
+            if recorder is not None and attempt is not None:
+                recorder._finish_attempt(
+                    attempt, AttemptOutcome.TRANSPORT_ERROR, exc=exc
+                )
+            raise
 
         assert isinstance(response.stream, SyncByteStream)
 
@@ -1021,6 +1173,11 @@ class Client(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+
+        if recorder is not None and attempt is not None:
+            recorder._finish_attempt(
+                attempt, AttemptOutcome.RESPONSE, response=response
+            )
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
@@ -1348,6 +1505,9 @@ class AsyncClient(BaseClient):
     * **default_encoding** - *(optional)* The default encoding to use for decoding
     response text, if no charset information is included in a response Content-Type
     header. Set to a callable for automatic character set detection. Default: "utf-8".
+    * **recorder** - *(optional)* A `RequestRecorder` instance used to record the
+    logical requests issued by this client, including every network attempt and
+    the step that triggered it.
     """
 
     def __init__(
@@ -1372,6 +1532,7 @@ class AsyncClient(BaseClient):
         transport: AsyncBaseTransport | None = None,
         trust_env: bool = True,
         default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+        recorder: RecorderTypes = None,
     ) -> None:
         super().__init__(
             auth=auth,
@@ -1385,6 +1546,7 @@ class AsyncClient(BaseClient):
             base_url=base_url,
             trust_env=trust_env,
             default_encoding=default_encoding,
+            recorder=recorder,
         )
 
         if http2:
@@ -1626,11 +1788,15 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        record = (
+            None if self._recorder is None else self._recorder._start_record(request)
+        )
         response = await self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            record=record,
         )
         try:
             if not stream:
@@ -1639,6 +1805,8 @@ class AsyncClient(BaseClient):
             return response
 
         except BaseException as exc:
+            if record is not None:
+                self._record_read_error(record, exc)
             await response.aclose()
             raise exc
 
@@ -1648,27 +1816,73 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        record: RequestRecord | None = None,
     ) -> Response:
+        recorder = self._recorder
         auth_flow = auth.async_auth_flow(request)
+        auth_step = 0
         try:
-            request = await auth_flow.__anext__()
+            try:
+                request = await auth_flow.__anext__()
+            except BaseException as exc:
+                if recorder is not None and record is not None:
+                    recorder._record_auth_step(
+                        record,
+                        outcome=AuthStepOutcome.EXCEPTION,
+                        sequence=auth_step,
+                        exc=exc,
+                    )
+                raise
 
             while True:
                 response = await self._send_handling_redirects(
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    history_start=len(history),
+                    record=record,
+                    auth_step=auth_step,
                 )
                 try:
                     try:
                         next_request = await auth_flow.asend(response)
                     except StopAsyncIteration:
+                        if recorder is not None and record is not None:
+                            recorder._record_auth_step(
+                                record,
+                                outcome=AuthStepOutcome.ENDED,
+                                sequence=auth_step,
+                                response=response,
+                            )
                         return response
+                    except BaseException as exc:
+                        if recorder is not None and record is not None:
+                            recorder._record_auth_step(
+                                record,
+                                outcome=AuthStepOutcome.EXCEPTION,
+                                sequence=auth_step,
+                                response=response,
+                                exc=exc,
+                            )
+                        raise
 
+                    if recorder is not None and record is not None:
+                        recorder._record_auth_step(
+                            record,
+                            outcome=AuthStepOutcome.CONTINUED,
+                            sequence=auth_step,
+                            response=response,
+                        )
                     response.history = list(history)
-                    await response.aread()
+                    try:
+                        await response.aread()
+                    except BaseException as exc:
+                        if record is not None:
+                            self._record_read_error(record, exc)
+                        raise
                     request = next_request
                     history.append(response)
+                    auth_step += 1
 
                 except BaseException as exc:
                     await response.aclose()
@@ -1681,7 +1895,11 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        history_start: int = 0,
+        record: RequestRecord | None = None,
+        auth_step: int = 0,
     ) -> Response:
+        recorder = self._recorder
         while True:
             if len(history) > self.max_redirects:
                 raise TooManyRedirects(
@@ -1691,10 +1909,47 @@ class AsyncClient(BaseClient):
             for hook in self._event_hooks["request"]:
                 await hook(request)
 
-            response = await self._send_single_request(request)
+            attempt: RequestAttempt | None = None
+            if recorder is not None and record is not None:
+                if len(history) > history_start:
+                    trigger = AttemptTrigger.REDIRECT
+                    source_response: Response | None = history[-1]
+                    redirect_status: int | None = history[-1].status_code
+                elif auth_step > 0:
+                    trigger = AttemptTrigger.AUTH_CONTINUATION
+                    source_response = history[-1]
+                    redirect_status = None
+                else:
+                    trigger = AttemptTrigger.INITIAL
+                    source_response = None
+                    redirect_status = None
+                attempt = recorder._record_attempt(
+                    record,
+                    request,
+                    trigger=trigger,
+                    auth_step=auth_step,
+                    redirect_step=len(history) - history_start,
+                    response=source_response,
+                    redirect_status=redirect_status,
+                )
+
+            response = await self._send_single_request(
+                request, record=record, attempt=attempt
+            )
             try:
                 for hook in self._event_hooks["response"]:
-                    await hook(response)
+                    try:
+                        await hook(response)
+                    except BaseException as exc:
+                        if recorder is not None and record is not None:
+                            assert attempt is not None
+                            recorder._finish_attempt(
+                                attempt,
+                                AttemptOutcome.HOOK_ERROR,
+                                response=response,
+                                exc=exc,
+                            )
+                        raise
 
                 response.history = list(history)
 
@@ -1705,7 +1960,12 @@ class AsyncClient(BaseClient):
                 history = history + [response]
 
                 if follow_redirects:
-                    await response.aread()
+                    try:
+                        await response.aread()
+                    except BaseException as exc:
+                        if record is not None:
+                            self._record_read_error(record, exc)
+                        raise
                 else:
                     response.next_request = request
                     return response
@@ -1714,10 +1974,16 @@ class AsyncClient(BaseClient):
                 await response.aclose()
                 raise exc
 
-    async def _send_single_request(self, request: Request) -> Response:
+    async def _send_single_request(
+        self,
+        request: Request,
+        record: RequestRecord | None = None,
+        attempt: RequestAttempt | None = None,
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
         """
+        recorder = self._recorder
         transport = self._transport_for_url(request.url)
         start = time.perf_counter()
 
@@ -1726,8 +1992,15 @@ class AsyncClient(BaseClient):
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        try:
+            with request_context(request=request):
+                response = await transport.handle_async_request(request)
+        except BaseException as exc:
+            if recorder is not None and attempt is not None:
+                recorder._finish_attempt(
+                    attempt, AttemptOutcome.TRANSPORT_ERROR, exc=exc
+                )
+            raise
 
         assert isinstance(response.stream, AsyncByteStream)
         response.request = request
@@ -1736,6 +2009,11 @@ class AsyncClient(BaseClient):
         )
         self.cookies.extract_cookies(response)
         response.default_encoding = self._default_encoding
+
+        if recorder is not None and attempt is not None:
+            recorder._finish_attempt(
+                attempt, AttemptOutcome.RESPONSE, response=response
+            )
 
         logger.info(
             'HTTP Request: %s %s "%s %d %s"',
