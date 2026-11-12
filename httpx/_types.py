@@ -90,6 +90,11 @@ __all__ = ["AsyncByteStream", "SyncByteStream"]
 
 
 class SyncByteStream:
+    # Whether the stream can be iterated again from the start, for example
+    # when a request needs to be resent as part of a retry. Streams that
+    # cannot be replayed, such as generators, should leave this as `False`.
+    is_replayable = False
+
     def __iter__(self) -> Iterator[bytes]:
         raise NotImplementedError(
             "The '__iter__' method must be implemented."
@@ -104,6 +109,12 @@ class SyncByteStream:
 
 
 class AsyncByteStream:
+    # Whether the stream can be iterated again from the start, for example
+    # when a request needs to be resent as part of a retry. Streams that
+    # cannot be replayed, such as async generators, should leave this as
+    # `False`.
+    is_replayable = False
+
     async def __aiter__(self) -> AsyncIterator[bytes]:
         raise NotImplementedError(
             "The '__aiter__' method must be implemented."

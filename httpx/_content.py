@@ -29,6 +29,9 @@ __all__ = ["ByteStream"]
 
 
 class ByteStream(AsyncByteStream, SyncByteStream):
+    # In-memory byte content can be sent again from the start.
+    is_replayable = True
+
     def __init__(self, stream: bytes) -> None:
         self._stream = stream
 

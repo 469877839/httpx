@@ -241,6 +241,15 @@ class MultipartStream(SyncByteStream, AsyncByteStream):
         )
         self.fields = list(self._iter_fields(data, files))
 
+    @property
+    def is_replayable(self) -> bool:
+        # File objects may have been consumed or not be seekable, so only
+        # in-memory file content can be safely sent more than once.
+        return all(
+            isinstance(field, DataField) or isinstance(field.file, (str, bytes))
+            for field in self.fields
+        )
+
     def _iter_fields(
         self, data: RequestData, files: RequestFiles
     ) -> typing.Iterator[FileField | DataField]:

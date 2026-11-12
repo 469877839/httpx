@@ -31,6 +31,7 @@ nav:
         - SSL: 'advanced/ssl.md'
         - Proxies: 'advanced/proxies.md'
         - Timeouts: 'advanced/timeouts.md'
+        - Retries: 'advanced/retries.md'
         - Resource Limits: 'advanced/resource-limits.md'
         - Event Hooks: 'advanced/event-hooks.md'
         - Transports: 'advanced/transports.md'

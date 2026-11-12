@@ -23,10 +23,13 @@ from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
     InvalidURL,
     RemoteProtocolError,
+    RetryExhausted,
+    TransportError,
     TooManyRedirects,
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._retry import Retry, RetryBudget
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -196,6 +199,7 @@ class BaseClient:
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: Retry | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         trust_env: bool = True,
@@ -212,6 +216,9 @@ class BaseClient:
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
+        if retry is not None and not isinstance(retry, Retry):
+            raise TypeError(f'Invalid "retry" argument: {retry!r}')
+        self._retry = retry
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
@@ -235,6 +242,20 @@ class BaseClient:
         if url.raw_path.endswith(b"/"):
             return url
         return url.copy_with(raw_path=url.raw_path + b"/")
+
+    @property
+    def retry(self) -> Retry | None:
+        """
+        The retry policy used when sending requests, or `None` if retries
+        are disabled.
+        """
+        return self._retry
+
+    @retry.setter
+    def retry(self, retry: Retry | None) -> None:
+        if retry is not None and not isinstance(retry, Retry):
+            raise TypeError(f'Invalid "retry" argument: {retry!r}')
+        self._retry = retry
 
     def _get_proxy_map(
         self, proxy: ProxyTypes | None, allow_env_proxies: bool
@@ -350,6 +371,7 @@ class BaseClient:
         headers: HeaderTypes | None = None,
         cookies: CookieTypes | None = None,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Request:
         """
@@ -358,6 +380,9 @@ class BaseClient:
         * The `params`, `headers` and `cookies` arguments
         are merged with any values set on the client.
         * The `url` argument is merged with any `base_url` set on the client.
+
+        Set `idempotent=True` to explicitly permit a request with a method
+        outside of the retry policy's `idempotent_methods` to be retried.
 
         See also: [Request instances][0]
 
@@ -368,6 +393,8 @@ class BaseClient:
         cookies = self._merge_cookies(cookies)
         params = self._merge_queryparams(params)
         extensions = {} if extensions is None else extensions
+        if idempotent is not None:
+            extensions = dict(**extensions, idempotent=idempotent)
         if "timeout" not in extensions:
             timeout = (
                 self.timeout
@@ -625,6 +652,9 @@ class Client(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **retry** - *(optional)* An `httpx.Retry` policy, bounding the total
+    attempts and duration of a single logical request. Retries are
+    disabled unless this is explicitly provided.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -654,6 +684,7 @@ class Client(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: Retry | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
@@ -667,6 +698,7 @@ class Client(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            retry=retry,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -783,6 +815,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -820,6 +853,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
         return self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -840,6 +874,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.Iterator[Response]:
         """
@@ -863,6 +898,7 @@ class Client(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
         response = self.send(
@@ -911,11 +947,14 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        budget = None if self._retry is None else self._retry.new_budget()
+
         response = self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            budget=budget,
         )
         try:
             if not stream:
@@ -933,6 +972,7 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        budget: RetryBudget | None,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +983,7 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    budget=budget,
                 )
                 try:
                     try:
@@ -966,6 +1007,7 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        budget: RetryBudget | None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -976,7 +1018,7 @@ class Client(BaseClient):
             for hook in self._event_hooks["request"]:
                 hook(request)
 
-            response = self._send_single_request(request)
+            response = self._send_single_request(request, budget)
             try:
                 for hook in self._event_hooks["response"]:
                     hook(response)
@@ -998,40 +1040,83 @@ class Client(BaseClient):
                 response.close()
                 raise exc
 
-    def _send_single_request(self, request: Request) -> Response:
+    def _send_single_request(
+        self, request: Request, budget: RetryBudget | None = None
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
+
+        When a retry policy is configured, transport failures and retryable
+        status codes are retried here, using a budget shared with any
+        surrounding redirects and authentication flows.
         """
         transport = self._transport_for_url(request.url)
-        start = time.perf_counter()
 
         if not isinstance(request.stream, SyncByteStream):
             raise RuntimeError(
                 "Attempted to send an async request with a sync Client instance."
             )
 
-        with request_context(request=request):
-            response = transport.handle_request(request)
+        retry = self._retry
+        last_exc: TransportError | None = None
+        while True:
+            if budget is not None:
+                try:
+                    budget.register_attempt(request)
+                except RetryExhausted as exc:
+                    raise exc from last_exc
 
-        assert isinstance(response.stream, SyncByteStream)
+            start = time.perf_counter()
 
-        response.request = request
-        response.stream = BoundSyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            try:
+                with request_context(request=request):
+                    response = transport.handle_request(request)
+            except TransportError as exc:
+                if retry is None or budget is None:
+                    raise
+                if not retry.is_retryable_method(request):
+                    raise
+                if not retry.is_retryable_exception(exc):
+                    raise
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+                last_exc = exc
+                delay = retry.compute_delay(budget.attempts, None)
+                budget.check_deadline(request, delay)
+                budget.check_replayable(request)
+                retry.sleep(delay)
+                continue
+            assert isinstance(response.stream, SyncByteStream)
 
-        return response
+            response.request = request
+            response.stream = BoundSyncStream(
+                response.stream, response=response, start=start
+            )
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
+
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
+
+            if retry is None or budget is None:
+                return response
+            if not retry.is_retryable_method(request):
+                return response
+            if not retry.is_retryable_status(response):
+                return response
+            if not budget.has_attempt_remaining():
+                return response
+
+            response.close()
+            delay = retry.compute_delay(budget.attempts, response)
+            budget.check_deadline(request, delay)
+            budget.check_replayable(request)
+            retry.sleep(delay)
 
     def get(
         self,
@@ -1043,6 +1128,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1059,6 +1145,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1072,6 +1159,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1088,6 +1176,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1101,6 +1190,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1117,6 +1207,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1134,6 +1225,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1154,6 +1246,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1171,6 +1264,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1191,6 +1285,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1208,6 +1303,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1228,6 +1324,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1241,6 +1338,7 @@ class Client(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1257,6 +1355,7 @@ class Client(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1339,6 +1438,9 @@ class AsyncClient(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **retry** - *(optional)* An `httpx.Retry` policy, bounding the total
+    attempts and duration of a single logical request. Retries are
+    disabled unless this is explicitly provided.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -1367,6 +1469,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: Retry | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
@@ -1381,6 +1484,7 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            retry=retry,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -1497,6 +1601,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1535,6 +1640,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
         return await self.send(request, auth=auth, follow_redirects=follow_redirects)
@@ -1555,6 +1661,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> typing.AsyncIterator[Response]:
         """
@@ -1578,6 +1685,7 @@ class AsyncClient(BaseClient):
             headers=headers,
             cookies=cookies,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
         response = await self.send(
@@ -1626,11 +1734,14 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        budget = None if self._retry is None else self._retry.new_budget()
+
         response = await self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            budget=budget,
         )
         try:
             if not stream:
@@ -1648,6 +1759,7 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        budget: RetryBudget | None,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1770,7 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    budget=budget,
                 )
                 try:
                     try:
@@ -1681,6 +1794,7 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        budget: RetryBudget | None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1691,7 +1805,7 @@ class AsyncClient(BaseClient):
             for hook in self._event_hooks["request"]:
                 await hook(request)
 
-            response = await self._send_single_request(request)
+            response = await self._send_single_request(request, budget)
             try:
                 for hook in self._event_hooks["response"]:
                     await hook(response)
@@ -1714,39 +1828,83 @@ class AsyncClient(BaseClient):
                 await response.aclose()
                 raise exc
 
-    async def _send_single_request(self, request: Request) -> Response:
+    async def _send_single_request(
+        self, request: Request, budget: RetryBudget | None = None
+    ) -> Response:
         """
         Sends a single request, without handling any redirections.
+
+        When a retry policy is configured, transport failures and retryable
+        status codes are retried here, using a budget shared with any
+        surrounding redirects and authentication flows.
         """
         transport = self._transport_for_url(request.url)
-        start = time.perf_counter()
 
         if not isinstance(request.stream, AsyncByteStream):
             raise RuntimeError(
                 "Attempted to send a sync request with an AsyncClient instance."
             )
 
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
+        retry = self._retry
+        last_exc: TransportError | None = None
+        while True:
+            if budget is not None:
+                try:
+                    budget.register_attempt(request)
+                except RetryExhausted as exc:
+                    raise exc from last_exc
 
-        assert isinstance(response.stream, AsyncByteStream)
-        response.request = request
-        response.stream = BoundAsyncStream(
-            response.stream, response=response, start=start
-        )
-        self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
+            start = time.perf_counter()
 
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
+            try:
+                with request_context(request=request):
+                    response = await transport.handle_async_request(request)
+            except TransportError as exc:
+                if retry is None or budget is None:
+                    raise
+                if not retry.is_retryable_method(request):
+                    raise
+                if not retry.is_retryable_exception(exc):
+                    raise
 
-        return response
+                last_exc = exc
+                delay = retry.compute_delay(budget.attempts, None)
+                budget.check_deadline(request, delay)
+                budget.check_replayable(request)
+                await retry.async_sleep(delay)
+                continue
+            assert isinstance(response.stream, AsyncByteStream)
+
+            response.request = request
+            response.stream = BoundAsyncStream(
+                response.stream, response=response, start=start
+            )
+            self.cookies.extract_cookies(response)
+            response.default_encoding = self._default_encoding
+
+            logger.info(
+                'HTTP Request: %s %s "%s %d %s"',
+                request.method,
+                request.url,
+                response.http_version,
+                response.status_code,
+                response.reason_phrase,
+            )
+
+            if retry is None or budget is None:
+                return response
+            if not retry.is_retryable_method(request):
+                return response
+            if not retry.is_retryable_status(response):
+                return response
+            if not budget.has_attempt_remaining():
+                return response
+
+            await response.aclose()
+            delay = retry.compute_delay(budget.attempts, response)
+            budget.check_deadline(request, delay)
+            budget.check_replayable(request)
+            await retry.async_sleep(delay)
 
     async def get(
         self,
@@ -1758,6 +1916,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1774,6 +1933,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1787,6 +1947,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1803,6 +1964,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1816,6 +1978,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1832,6 +1995,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1849,6 +2013,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1869,6 +2034,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1886,6 +2052,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1906,6 +2073,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1923,6 +2091,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1943,6 +2112,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 
@@ -1956,6 +2126,7 @@ class AsyncClient(BaseClient):
         auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
         timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        idempotent: bool | None = None,
         extensions: RequestExtensions | None = None,
     ) -> Response:
         """
@@ -1972,6 +2143,7 @@ class AsyncClient(BaseClient):
             auth=auth,
             follow_redirects=follow_redirects,
             timeout=timeout,
+            idempotent=idempotent,
             extensions=extensions,
         )
 

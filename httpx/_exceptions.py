@@ -20,6 +20,10 @@ Our exception hierarchy:
       - ProxyError
       - UnsupportedProtocol
     + DecodingError
+    + RetryError
+      · RetryExhausted
+      · RetryTimeout
+      · NonReplayableRequest
     + TooManyRedirects
   x HTTPStatusError
 * InvalidURL
@@ -50,6 +54,7 @@ __all__ = [
     "InvalidURL",
     "LocalProtocolError",
     "NetworkError",
+    "NonReplayableRequest",
     "PoolTimeout",
     "ProtocolError",
     "ProxyError",
@@ -57,6 +62,9 @@ __all__ = [
     "ReadTimeout",
     "RemoteProtocolError",
     "RequestError",
+    "RetryError",
+    "RetryExhausted",
+    "RetryTimeout",
     "RequestNotRead",
     "ResponseNotRead",
     "StreamClosed",
@@ -249,6 +257,46 @@ class DecodingError(RequestError):
 class TooManyRedirects(RequestError):
     """
     Too many redirects.
+    """
+
+
+# Retry exceptions...
+#
+# These are raised when a client is configured with an explicit `httpx.Retry`
+# policy, and a logical request cannot be completed within the retry budget.
+
+
+class RetryError(RequestError):
+    """
+    Base class for exceptions raised while applying a retry policy.
+    """
+
+
+class RetryExhausted(RetryError):
+    """
+    The retry policy's attempt budget was exhausted.
+
+    Raised instead of the final transport error when the maximum number of
+    attempts for a logical request has been reached. The original transport
+    error is available as the exception `__cause__`.
+    """
+
+
+class RetryTimeout(RetryError):
+    """
+    The retry policy's overall deadline was exceeded.
+
+    Raised when a retry would be scheduled after the total time limit for a
+    logical request has elapsed.
+    """
+
+
+class NonReplayableRequest(RetryError):
+    """
+    A retry was required, but the request body cannot be replayed.
+
+    Raised when a retryable failure occurs for a request with a streaming
+    body that cannot be sent again, such as content given as a generator.
     """
 
 
