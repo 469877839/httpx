@@ -21,12 +21,17 @@ from ._config import (
 )
 from ._decoders import SUPPORTED_DECODERS
 from ._exceptions import (
+    ConnectError,
+    ConnectTimeout,
     InvalidURL,
+    ReadError,
+    ReadTimeout,
     RemoteProtocolError,
     TooManyRedirects,
     request_context,
 )
 from ._models import Cookies, Headers, Request, Response
+from ._retry import RetryPolicy, RetryState
 from ._status_codes import codes
 from ._transports.base import AsyncBaseTransport, BaseTransport
 from ._transports.default import AsyncHTTPTransport, HTTPTransport
@@ -196,6 +201,7 @@ class BaseClient:
         timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
         follow_redirects: bool = False,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: RetryPolicy | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         trust_env: bool = True,
@@ -212,6 +218,7 @@ class BaseClient:
         self._timeout = Timeout(timeout)
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
+        self._retry = retry
         self._event_hooks = {
             "request": list(event_hooks.get("request", [])),
             "response": list(event_hooks.get("response", [])),
@@ -625,6 +632,9 @@ class Client(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **retry** - *(optional)* An explicit `RetryPolicy` enabling bounded
+    retries, with a unified attempt budget and deadline shared across
+    authentication, redirects, and transport errors.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -654,6 +664,7 @@ class Client(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: RetryPolicy | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: BaseTransport | None = None,
@@ -667,6 +678,7 @@ class Client(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            retry=retry,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -911,11 +923,15 @@ class Client(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        retry = request.extensions.get("retry", self._retry)
+        retry_state = RetryState(retry) if retry is not None else None
+
         response = self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            retry_state=retry_state,
         )
         try:
             if not stream:
@@ -933,6 +949,7 @@ class Client(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        retry_state: RetryState | None = None,
     ) -> Response:
         auth_flow = auth.sync_auth_flow(request)
         try:
@@ -943,6 +960,7 @@ class Client(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    retry_state=retry_state,
                 )
                 try:
                     try:
@@ -966,6 +984,7 @@ class Client(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        retry_state: RetryState | None = None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -973,14 +992,46 @@ class Client(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
+            if retry_state is not None:
+                retry_state.before_attempt(request)
+
             for hook in self._event_hooks["request"]:
                 hook(request)
 
-            response = self._send_single_request(request)
+            try:
+                response = self._send_single_request(request)
+            except (ConnectError, ConnectTimeout, ReadError, ReadTimeout) as exc:
+                if retry_state is None:
+                    raise
+                policy = retry_state.policy
+                if isinstance(exc, (ConnectError, ConnectTimeout)):
+                    if not policy.retry_on_connect_error:
+                        raise
+                elif not policy.retry_on_read_error:
+                    raise
+                delay = retry_state.retry_delay(request)
+                if delay is None:
+                    raise
+                policy.sleep(delay)
+                continue
+
             try:
                 for hook in self._event_hooks["response"]:
                     hook(response)
+
                 response.history = list(history)
+
+                if (
+                    retry_state is not None
+                    and response.status_code in retry_state.policy.retry_status_codes
+                ):
+                    delay = retry_state.retry_delay(request, response=response)
+                    if delay is not None:
+                        # The response stream must be closed before retrying.
+                        response.read()
+                        response.close()
+                        retry_state.policy.sleep(delay)
+                        continue
 
                 if not response.has_redirect_location:
                     return response
@@ -1339,6 +1390,9 @@ class AsyncClient(BaseClient):
     * **limits** - *(optional)* The limits configuration to use.
     * **max_redirects** - *(optional)* The maximum number of redirect responses
     that should be followed.
+    * **retry** - *(optional)* An explicit `RetryPolicy` enabling bounded
+    retries, with a unified attempt budget and deadline shared across
+    authentication, redirects, and transport errors.
     * **base_url** - *(optional)* A URL to use as the base when building
     request URLs.
     * **transport** - *(optional)* A transport class to use for sending requests
@@ -1367,6 +1421,7 @@ class AsyncClient(BaseClient):
         follow_redirects: bool = False,
         limits: Limits = DEFAULT_LIMITS,
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        retry: RetryPolicy | None = None,
         event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
         base_url: URL | str = "",
         transport: AsyncBaseTransport | None = None,
@@ -1381,6 +1436,7 @@ class AsyncClient(BaseClient):
             timeout=timeout,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
+            retry=retry,
             event_hooks=event_hooks,
             base_url=base_url,
             trust_env=trust_env,
@@ -1626,11 +1682,15 @@ class AsyncClient(BaseClient):
 
         auth = self._build_request_auth(request, auth)
 
+        retry = request.extensions.get("retry", self._retry)
+        retry_state = RetryState(retry) if retry is not None else None
+
         response = await self._send_handling_auth(
             request,
             auth=auth,
             follow_redirects=follow_redirects,
             history=[],
+            retry_state=retry_state,
         )
         try:
             if not stream:
@@ -1648,6 +1708,7 @@ class AsyncClient(BaseClient):
         auth: Auth,
         follow_redirects: bool,
         history: list[Response],
+        retry_state: RetryState | None = None,
     ) -> Response:
         auth_flow = auth.async_auth_flow(request)
         try:
@@ -1658,6 +1719,7 @@ class AsyncClient(BaseClient):
                     request,
                     follow_redirects=follow_redirects,
                     history=history,
+                    retry_state=retry_state,
                 )
                 try:
                     try:
@@ -1681,6 +1743,7 @@ class AsyncClient(BaseClient):
         request: Request,
         follow_redirects: bool,
         history: list[Response],
+        retry_state: RetryState | None = None,
     ) -> Response:
         while True:
             if len(history) > self.max_redirects:
@@ -1688,15 +1751,46 @@ class AsyncClient(BaseClient):
                     "Exceeded maximum allowed redirects.", request=request
                 )
 
+            if retry_state is not None:
+                retry_state.before_attempt(request)
+
             for hook in self._event_hooks["request"]:
                 await hook(request)
 
-            response = await self._send_single_request(request)
+            try:
+                response = await self._send_single_request(request)
+            except (ConnectError, ConnectTimeout, ReadError, ReadTimeout) as exc:
+                if retry_state is None:
+                    raise
+                policy = retry_state.policy
+                if isinstance(exc, (ConnectError, ConnectTimeout)):
+                    if not policy.retry_on_connect_error:
+                        raise
+                elif not policy.retry_on_read_error:
+                    raise
+                delay = retry_state.retry_delay(request)
+                if delay is None:
+                    raise
+                await policy.async_sleep(delay)
+                continue
+
             try:
                 for hook in self._event_hooks["response"]:
                     await hook(response)
 
                 response.history = list(history)
+
+                if (
+                    retry_state is not None
+                    and response.status_code in retry_state.policy.retry_status_codes
+                ):
+                    delay = retry_state.retry_delay(request, response=response)
+                    if delay is not None:
+                        # The response stream must be closed before retrying.
+                        await response.aread()
+                        await response.aclose()
+                        await retry_state.policy.async_sleep(delay)
+                        continue
 
                 if not response.has_redirect_location:
                     return response

@@ -13,6 +13,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 * Expose `FunctionAuth` from the public API. (#3699)
+* Add an explicitly enabled `httpx.RetryPolicy`, bounding one logical request
+by a unified attempt budget and deadline shared across authentication,
+redirects, and transport errors. Retries are permitted for replayable
+`GET`/`HEAD` requests and explicitly permitted idempotent methods, honour
+`Retry-After`, and close response streams before the next attempt.
 
 ## 0.28.1 (6th December, 2024)
 

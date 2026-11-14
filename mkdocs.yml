@@ -32,6 +32,7 @@ nav:
         - Proxies: 'advanced/proxies.md'
         - Timeouts: 'advanced/timeouts.md'
         - Resource Limits: 'advanced/resource-limits.md'
+        - Retries: 'advanced/retry.md'
         - Event Hooks: 'advanced/event-hooks.md'
         - Transports: 'advanced/transports.md'
         - Text Encodings: 'advanced/text-encodings.md'

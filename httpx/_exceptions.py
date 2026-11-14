@@ -21,6 +21,9 @@ Our exception hierarchy:
       - UnsupportedProtocol
     + DecodingError
     + TooManyRedirects
+    + RetryError
+      - RetryBudgetExceeded
+      - RequestNotReplayable
   x HTTPStatusError
 * InvalidURL
 * CookieConflict
@@ -56,9 +59,12 @@ __all__ = [
     "ReadError",
     "ReadTimeout",
     "RemoteProtocolError",
+    "RequestNotReplayable",
     "RequestError",
     "RequestNotRead",
     "ResponseNotRead",
+    "RetryBudgetExceeded",
+    "RetryError",
     "StreamClosed",
     "StreamConsumed",
     "StreamError",
@@ -249,6 +255,29 @@ class DecodingError(RequestError):
 class TooManyRedirects(RequestError):
     """
     Too many redirects.
+    """
+
+
+# Retry policy exceptions...
+
+
+class RetryError(RequestError):
+    """
+    Base class for errors raised by an explicitly enabled retry policy.
+    """
+
+
+class RetryBudgetExceeded(RetryError):
+    """
+    The unified attempt budget or deadline of a `RetryPolicy` was exhausted
+    before the logical request could complete.
+    """
+
+
+class RequestNotReplayable(RetryError):
+    """
+    A retry was refused because the request has a streaming body that
+    cannot be replayed.
     """
 
 

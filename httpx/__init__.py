@@ -6,6 +6,7 @@ from ._config import *
 from ._content import *
 from ._exceptions import *
 from ._models import *
+from ._retry import *
 from ._status_codes import *
 from ._transports import *
 from ._types import *
@@ -80,8 +81,12 @@ __all__ = [
     "Request",
     "RequestError",
     "RequestNotRead",
+    "RequestNotReplayable",
     "Response",
     "ResponseNotRead",
+    "RetryBudgetExceeded",
+    "RetryError",
+    "RetryPolicy",
     "stream",
     "StreamClosed",
     "StreamConsumed",
